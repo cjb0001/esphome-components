@@ -8,15 +8,24 @@
 
 #include <esp32-hal-gpio.h>
 
+// Partial refresh approach inspired by 
+// https://github.com/DooMMasteR/esphome-lilygo-t547plus-partial-refresh
+// (which is for t547plus)
+
+// Perform a full refresh every 3 hours
+#define FULL_REFRESH_EVERY_MILLIS (3*60*60*1000)
+
 namespace esphome {
 namespace t547 {
 
 static const char *const TAG = "t574";
 
+uint32_t last_full_refresh=0; // Last timestamp of full refresh
+
 void T547::setup() {
   this->initialize_();
-  this->clean();
-  this->display();
+  // this->clean();
+  // this->display();
 }
 
 void T547::initialize_() {
@@ -25,8 +34,14 @@ void T547::initialize_() {
 
   if (this->buffer_ != nullptr) {
     free(this->buffer_);  // NOLINT
-
-  epd_init();
+  }
+  if (this->buffer_prev_ != nullptr) {
+    free(this->buffer_prev_);  // NOLINT
+  }
+  if (this->buffer_ != nullptr || this->buffer_prev_ != nullptr) {
+    this->buffer_ = nullptr;
+    this->buffer_prev_ = nullptr;
+    epd_init();
   }
 
   this->buffer_ = (uint8_t *) ps_malloc(buffer_size);
@@ -38,6 +53,16 @@ void T547::initialize_() {
   }
   uint8_t background = invert_ ? 255 : 0;
   memset(this->buffer_, background, buffer_size);
+
+  this->buffer_prev_ = (uint8_t *) ps_malloc(buffer_size);
+
+  if (this->buffer_prev_ == nullptr) {
+    ESP_LOGE(TAG, "Could not allocate prev buffer for display!");
+    this->mark_failed();
+    return;
+  }
+  memset(this->buffer_prev_, background, buffer_size);  
+  
   ESP_LOGV(TAG, "Initialize complete");
 }
 
@@ -70,7 +95,7 @@ void T547::eink_off_() {
   ESP_LOGV(TAG, "Eink off called");
   if (panel_on_ == 0)
     return;
-  epd_poweroff();
+  epd_poweroff_all();
   panel_on_ = 0;
 }
 
@@ -86,10 +111,46 @@ void T547::display() {
   ESP_LOGV(TAG, "Display called");
   uint32_t start_time = millis();
 
-  epd_poweron();
-  epd_clear();
-  epd_draw_grayscale_image(epd_full_screen(), this->buffer_);
-  epd_poweroff();
+  // determine the area that has to be refreshed
+  int width = this->get_width_internal();
+  int height = this->get_height_internal();
+  int xmin = width - 1;
+  int xmax = 0;
+  int ymin = height - 1;
+  int ymax = 0;
+  uint8_t *ptr = this->buffer_;
+  uint8_t *ptr_prev = this->buffer_prev_;
+  // Scan for changes
+  for (int y = 0; y < height; y++) {
+    // one byte in buffer_ contains two pixels with 4 bits each
+    // -> increment x by 2
+    for (int x = 0; x < width; x += 2) {
+      if (*ptr++ != *ptr_prev++) {
+        if (xmin > x) xmin = x;
+        if (xmax < x) xmax = x;
+        if (ymin > y) ymin = y;
+        if (ymax < y) ymax = y;
+      }
+    }
+  }
+  ESP_LOGV(TAG, "Display area to refresh: xmin = %d xmax = %d ymin = %d ymax = %d", xmin, xmax, ymin, ymax);
+
+  if (xmin <= xmax && ymin <= ymax) {
+	// Add 2 pixels left and right
+	if (xmin != 0) xmin -= 2;
+	if (xmax < width - 2) xmax += 2;
+    Rect_t area = {.x = xmin, .y = ymin, .width = xmax - xmin + 2, .height = ymax - ymin + 1};
+    epd_poweron();
+    if (area.width >= width/2 || area.height >= height/2 || millis()-last_full_refresh >= FULL_REFRESH_EVERY_MILLIS) {
+	  last_full_refresh = millis();
+      epd_clear();
+    } else {
+	  epd_clear_area(area);
+    }
+    epd_draw_grayscale_image(epd_full_screen(), this->buffer_);
+    epd_poweroff_all();
+  }
+  memcpy(this->buffer_prev_, this->buffer_, this->get_buffer_length_());
 
   ESP_LOGV(TAG, "Display finished (full) (%ums)", millis() - start_time);
 }
